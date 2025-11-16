@@ -38,49 +38,93 @@ class SystemBenchmark:
         }
     
     def detect_working_cores(self):
-        """Detect how many CPU cores are actually working"""
-        print("Detecting working CPU cores...")
+        """Detect how many CPU cores are actually usable by measuring parallel execution"""
+        print("Detecting usable CPU cores...")
         
         total_cores = multiprocessing.cpu_count()
-        working_cores = 0
-        core_results = []
+        actual_cores = 0
+        cpu_usage_samples = []
         
-        def core_test(core_id):
-            """Test if a specific core is working"""
-            try:
-                # Pin to specific core if possible
-                start_time = time.time()
-                # Do some intensive calculations
-                for i in range(1000000):
+        def cpu_intensive_task(duration=2):
+            """CPU-intensive task that runs for specified duration"""
+            end_time = time.time() + duration
+            operations = 0
+            while time.time() < end_time:
+                # Do intensive calculations
+                for i in range(10000):
                     _ = i * i * i
-                end_time = time.time()
-                return True, end_time - start_time
-            except:
-                return False, 0
+                operations += 1
+            return operations
         
-        # Test each core
-        with ThreadPoolExecutor(max_workers=total_cores) as executor:
-            futures = [executor.submit(core_test, i) for i in range(total_cores)]
-            for i, future in enumerate(futures):
-                working, duration = future.result()
-                if working:
-                    working_cores += 1
-                core_results.append({
-                    'core_id': i,
-                    'working': working,
-                    'test_duration': duration
-                })
+        def monitor_cpu_usage(stop_event, samples_list):
+            """Monitor CPU usage while tests are running"""
+            while not stop_event.is_set():
+                samples_list.append(psutil.cpu_percent(interval=0.1))
+                time.sleep(0.1)
+        
+        print(f"  Testing with 1 thread...")
+        stop_event = threading.Event()
+        monitor_thread = threading.Thread(target=monitor_cpu_usage, args=(stop_event, cpu_usage_samples))
+        monitor_thread.start()
+        
+        # Test with 1 thread first
+        start_time = time.time()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(cpu_intensive_task, 3)
+            future.result()
+        cpu_1_thread = sum(cpu_usage_samples[-30:]) / 30 if len(cpu_usage_samples) >= 30 else 0
+        cpu_usage_samples.clear()
+        
+        # Gradually increase threads and measure CPU utilization
+        max_cpu_usage = 0
+        effective_cores = 0
+        
+        for threads in range(1, min(total_cores + 1, 17)):  # Test up to 16 threads
+            print(f"  Testing with {threads} thread(s)...")
+            
+            # Clear samples and run test
+            cpu_usage_samples.clear()
+            start_time = time.time()
+            
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = [executor.submit(cpu_intensive_task, 2) for _ in range(threads)]
+                for future in futures:
+                    future.result()
+            
+            # Calculate average CPU usage for this test
+            avg_cpu = sum(cpu_usage_samples) / len(cpu_usage_samples) if cpu_usage_samples else 0
+            print(f"    Average CPU usage: {avg_cpu:.1f}%")
+            
+            # If this gives us more CPU usage than before, update effective cores
+            if avg_cpu > max_cpu_usage:
+                max_cpu_usage = avg_cpu
+                effective_cores = threads
+            # If adding more threads doesn't increase CPU usage significantly, stop
+            elif threads > 1 and avg_cpu < max_cpu_usage * 1.05:  # Less than 5% improvement
+                print(f"    No significant improvement with {threads} threads")
+                break
+        
+        stop_event.set()
+        monitor_thread.join()
+        
+        # Calculate actual cores based on maximum CPU usage observed
+        # 100% CPU usage = 1 core, 200% = 2 cores, etc.
+        actual_cores = max(1, int(max_cpu_usage / 100 + 0.5))  # Round to nearest integer
         
         self.results['cpu']['core_detection'] = {
-            'total_cores': total_cores,
-            'working_cores': working_cores,
-            'core_details': core_results
+            'total_logical_cores': total_cores,
+            'effective_parallel_cores': actual_cores,
+            'max_cpu_usage_percent': max_cpu_usage,
+            'optimal_thread_count': effective_cores,
+            'tested_thread_counts': list(range(1, effective_cores + 1))
         }
         
-        print(f"  Total cores: {total_cores}")
-        print(f"  Working cores: {working_cores}")
+        print(f"  Total logical cores: {total_cores}")
+        print(f"  Effective parallel cores: {actual_cores}")
+        print(f"  Maximum CPU utilization: {max_cpu_usage:.1f}%")
+        print(f"  Optimal thread count: {effective_cores}")
         
-        return working_cores
+        return actual_cores
     
     def benchmark_cpu(self, duration=30, threads=None):
         """Benchmark CPU with precise measurements"""
@@ -162,7 +206,7 @@ class SystemBenchmark:
         return self.results['cpu']
     
     def test_max_memory_allocation(self):
-        """Test maximum memory that can be allocated"""
+        """Test maximum memory that can be allocated safely"""
         print("Testing maximum memory allocation capacity...")
         
         mem_info = psutil.virtual_memory()
@@ -172,55 +216,93 @@ class SystemBenchmark:
         print(f"  Total memory: {total_gb:.2f}GB")
         print(f"  Available memory: {available_gb:.2f}GB")
         
-        # too much can damage host
-        test_size = available_gb * 0.7
-        chunk_size = 100 * 1024 * 1024  # 100MB chunks
+        # Conservative approach: start with 50% of available memory
+        max_safe_size = min(available_gb * 0.5, total_gb * 0.8)  # Max 80% of total memory
+        test_size = max_safe_size
+        chunk_size = 50 * 1024 * 1024  # 50MB chunks (smaller for safety)
         max_allocated = 0
         memory_blocks = []
         
+        def check_memory_pressure():
+            """Check if system is under memory pressure"""
+            mem = psutil.virtual_memory()
+            # If memory usage > 90% or available < 100MB, stop
+            return mem.percent > 90 or mem.available < 100 * 1024 * 1024
+        
         try:
-            while test_size > 0.1:  # Minimum 100MB
+            # Binary search approach to find max allocatable memory
+            min_size = 0.1  # 100MB minimum
+            max_size = max_safe_size
+            
+            while max_size - min_size > 0.1:  # Continue until difference < 100MB
+                test_size = (min_size + max_size) / 2
                 print(f"  Testing allocation of {test_size:.2f}GB...")
                 
+                # Check memory pressure first
+                if check_memory_pressure():
+                    print(f"  ⚠ High memory pressure detected, reducing test size")
+                    max_size = test_size * 0.8
+                    memory_blocks.clear()
+                    continue
+                
                 try:
-                    # Try to allocate memory in chunks
+                    # Try to allocate memory in smaller chunks
                     target_bytes = int(test_size * 1024**3)
                     allocated = 0
-                    
-                    while allocated < target_bytes:
-                        block = bytearray(min(chunk_size, target_bytes - allocated))
-                        memory_blocks.append(block)
-                        allocated += chunk_size
-                        
-                        if len(memory_blocks) % 10 == 0:
-                            print(f"    Allocated: {allocated / (1024**3):.2f}GB")
-                    
-                    max_allocated = allocated / (1024**3)
-                    print(f"  ✓ Successfully allocated {max_allocated:.2f}GB")
-                    
-                    # Try to allocate even more if successful
-                    #test_size = min(test_size * 1.1, total_gb * 1.2)  # Try 10% more, up to 120% of total
-                    test_size = 0 # enough. quit
-                    
-                except MemoryError:
-                    print(f"  ✗ Failed to allocate {test_size:.2f}GB")
-                    test_size *= 0.9  # Try 90% of previous size
                     memory_blocks.clear()
                     
+                    while allocated < target_bytes:
+                        # Check memory pressure before each chunk
+                        if check_memory_pressure():
+                            print(f"  ⚠ Memory pressure detected during allocation")
+                            break
+                        
+                        block = bytearray(min(chunk_size, target_bytes - allocated))
+                        memory_blocks.append(block)
+                        allocated += len(block)
+                        
+                        if len(memory_blocks) % 20 == 0:  # Report every 1GB
+                            print(f"    Allocated: {allocated / (1024**3):.2f}GB")
+                    
+                    if allocated >= target_bytes * 0.95:  # Success if allocated 95% of target
+                        max_allocated = allocated / (1024**3)
+                        print(f"  ✓ Successfully allocated {max_allocated:.2f}GB")
+                        min_size = test_size  # Try larger size
+                    else:
+                        print(f"  ✗ Partial allocation: {allocated / (1024**3):.2f}GB")
+                        max_size = test_size * 0.9  # Try smaller size
+                    
+                except MemoryError:
+                    print(f"  ✗ MemoryError at {test_size:.2f}GB")
+                    max_size = test_size * 0.8  # Try smaller size
+                    memory_blocks.clear()
+                    
+                except Exception as e:
+                    print(f"  ✗ Error: {e}")
+                    max_size = test_size * 0.8
+                    memory_blocks.clear()
+                
+                # Always clean up between attempts
+                memory_blocks.clear()
+                
+                # Small delay to allow system to stabilize
+                time.sleep(0.5)
+        
         except Exception as e:
             print(f"  Error during memory test: {e}")
         
-        # Clean up
+        # Final cleanup
         memory_blocks.clear()
         
         self.results['memory']['max_allocation_test'] = {
             'total_memory_gb': total_gb,
             'available_memory_gb': available_gb,
             'max_allocated_gb': max_allocated,
-            'allocation_success_rate': (max_allocated / available_gb) * 100 if available_gb > 0 else 0
+            'allocation_success_rate': (max_allocated / available_gb) * 100 if available_gb > 0 else 0,
+            'safety_margin_used': max_safe_size / available_gb if available_gb > 0 else 0
         }
         
-        print(f"  Maximum allocatable: {max_allocated:.2f}GB")
+        print(f"  Maximum safe allocation: {max_allocated:.2f}GB")
         return max_allocated
     
     def benchmark_memory(self, test_size_gb=1):
