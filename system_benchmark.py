@@ -217,7 +217,7 @@ class SystemBenchmark:
         print(f"  Available memory: {available_gb:.2f}GB")
         
         # Conservative approach: start with 50% of available memory
-        max_safe_size = min(available_gb * 0.5, total_gb * 0.8)  # Max 80% of total memory
+        max_safe_size = min(available_gb * 0.9, total_gb * 0.8)  # Max 80% of total memory
         test_size = max_safe_size
         chunk_size = 50 * 1024 * 1024  # 50MB chunks (smaller for safety)
         max_allocated = 0
@@ -226,8 +226,8 @@ class SystemBenchmark:
         def check_memory_pressure():
             """Check if system is under memory pressure"""
             mem = psutil.virtual_memory()
-            # If memory usage > 90% or available < 100MB, stop
-            return mem.percent > 90 or mem.available < 100 * 1024 * 1024
+            # If memory usage > x% or available < 100MB, stop
+            return mem.percent > 99 or mem.available < 100 * 1024 * 1024
         
         try:
             # Binary search approach to find max allocatable memory
